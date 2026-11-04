@@ -1,0 +1,3 @@
+# Fabric runtime provides Spark SQL and the Kafka Structured Streaming connector.
+# Add only pre-staged, runtime-compatible wheels here; do not rely on public PyPI
+# or Maven access after workspace outbound access protection is enabled.
