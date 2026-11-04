@@ -1,0 +1,9 @@
+.create-merge table RawEvents (
+    message_id: string,
+    run_id: string,
+    equipment_id: int,
+    temperature: real,
+    timestamp: datetime,
+    payload: dynamic
+)
+.alter table RawEvents policy streamingingestion enable

@@ -1,0 +1,10 @@
+{
+  "driverCores": 8,
+  "driverMemory": "56g",
+  "executorCores": 8,
+  "executorMemory": "56g",
+  "numExecutors": 1,
+  "conf": {
+    "spark.dynamicAllocation.enabled": "false"
+  }
+}

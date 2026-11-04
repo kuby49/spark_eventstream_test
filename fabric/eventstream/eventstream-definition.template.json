@@ -1,0 +1,102 @@
+{
+  "sources": [
+    {
+      "name": "VmKafkaIngress",
+      "type": "CustomEndpoint",
+      "properties": {}
+    }
+  ],
+  "destinations": [
+    {
+      "name": "RawEvents",
+      "type": "Eventhouse",
+      "properties": {
+        "dataIngestionMode": "ProcessedIngestion",
+        "workspaceId": "{{WORKSPACE_ID}}",
+        "itemId": "{{KQL_DATABASE_ID}}",
+        "databaseName": "ehspark",
+        "tableName": "RawEvents",
+        "inputSerialization": {
+          "type": "Json",
+          "properties": {
+            "encoding": "UTF8"
+          }
+        }
+      },
+      "inputNodes": [
+        {
+          "name": "esspark-stream"
+        }
+      ]
+    },
+    {
+      "name": "HighTemperatureKafka",
+      "type": "CustomEndpoint",
+      "properties": {},
+      "inputNodes": [
+        {
+          "name": "HighTemperatureEvents"
+        }
+      ]
+    }
+  ],
+  "streams": [
+    {
+      "name": "esspark-stream",
+      "type": "DefaultStream",
+      "properties": {},
+      "inputNodes": [
+        {
+          "name": "VmKafkaIngress"
+        }
+      ]
+    },
+    {
+      "name": "HighTemperatureEvents",
+      "type": "DerivedStream",
+      "properties": {
+        "inputSerialization": {
+          "type": "Json",
+          "properties": {
+            "encoding": "UTF8"
+          }
+        }
+      },
+      "inputNodes": [
+        {
+          "name": "HighTemperatureFilter"
+        }
+      ]
+    }
+  ],
+  "operators": [
+    {
+      "name": "HighTemperatureFilter",
+      "type": "Filter",
+      "inputNodes": [
+        {
+          "name": "esspark-stream"
+        }
+      ],
+      "properties": {
+        "conditions": [
+          {
+            "column": {
+              "node": null,
+              "columnName": "temperature",
+              "columnPath": null,
+              "expressionType": "ColumnReference"
+            },
+            "operatorType": "GreaterThan",
+            "value": {
+              "dataType": "Float",
+              "value": "80.0",
+              "expressionType": "Literal"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "compatibilityLevel": "1.1"
+}
