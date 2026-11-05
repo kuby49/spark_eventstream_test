@@ -10,15 +10,66 @@ baseline_error = None
 baseline_start = datetime.now(timezone.utc)
 active = None
 LOAD_TEST = "<injected-load-test>" == "true"
+STRESS_TEST = "<injected-stress-test>" == "true"
+PREVIOUS_STRESS_RUN_ID = "<injected-previous-stress-run-id>"
 SUSTAINED_DIAGNOSTIC = "<injected-sustained-diagnostic>" == "true"
 TEST_RATE = int("<injected-test-rate>")
 TEST_MINUTES = int("<injected-test-minutes>")
 EXPECTED_HIGH = TEST_RATE * TEST_MINUTES // 10
 optimization_results = []
+post_step_optimization = {"status": "NotRequested", "results": []}
 warm_kafka_metadata = None
 consumer_warmup = None
 kql_warmup = None
 session_allocation = None
+stress_health = []
+stress_health_errors = []
+stress_last_sample = 0.0
+stress_last_offsets = 0.0
+stress_broker = None
+stress_scaling_events = []
+stress_previous_executors = None
+
+
+def stress_sample(progress):
+    global stress_last_sample, stress_last_offsets, stress_broker, stress_previous_executors
+    if not STRESS_TEST or time.monotonic() - stress_last_sample < 15:
+        return
+    stress_last_sample = time.monotonic()
+    allocation = _verify_session_allocation()
+    executors = allocation["activeExecutors"]
+    if stress_previous_executors is not None and executors != stress_previous_executors:
+        stress_scaling_events.append({
+            "observedAtUtc": allocation["checkedAtUtc"],
+            "fromExecutors": stress_previous_executors, "toExecutors": executors,
+            "direction": "up" if executors > stress_previous_executors else "down",
+            "observedDriverAndExecutorCores": allocation["observedDriverAndExecutorCores"],
+        })
+    stress_previous_executors = executors
+    if time.monotonic() - stress_last_offsets >= 60:
+        stress_broker = broker_metadata()
+        stress_last_offsets = time.monotonic()
+    offsets = (progress or {}).get("sources", [{}])[0].get("endOffset", {}).get(KAFKA_TOPIC, {})
+    lag = [{"partition": row["partition"], "end": row["end"],
+            "committed": offsets.get(str(row["partition"])),
+            "lagEnvelopes": (max(0, row["end"] - offsets[str(row["partition"])]))
+            if str(row["partition"]) in offsets else None}
+           for row in stress_broker["partitionOffsets"]]
+    sample = {
+        "runId": RUN_ID, "atUtc": datetime.now(timezone.utc).isoformat(),
+        "consumerActive": active.isActive,
+        "completedLogicalEvents": sum(batch["logicalEvents"] for batch in baseline_batches),
+        "observedLogicalEvents": len(baseline_derived), "partitionLag": lag,
+        "lastBatchFinishedAtUtc": baseline_batches[-1]["finishedAtUtc"] if baseline_batches else None,
+        "progress": progress,
+        "allocation": allocation, "scalingEvents": list(stress_scaling_events),
+        "rejections": [{"stage": timing["stage"], "errorCode": timing.get("errorCode"),
+                        "errorType": timing.get("errorType")}
+                       for timing in stage_timings if timing.get("errorType")],
+    }
+    stress_health.append(sample)
+    notebookutils.fs.put(f"Files/diagnostics/stress-health-{RUN_ID}.json",
+                        json.dumps(sample), True)
 
 
 def baseline_progress_dict(progress):
@@ -57,11 +108,13 @@ def baseline_batch(batch, batch_id):
 try:
     session_allocation = _verify_session_allocation()
     kql_warmup = warm_kql_transport()
-    if LOAD_TEST:
+    if LOAD_TEST and not STRESS_TEST:
         for table in (TABLE_EVENTS, TABLE_SCORES):
             optimized_at = datetime.now(timezone.utc).isoformat()
             metrics = [row.asDict(recursive=True) for row in spark.sql(f"OPTIMIZE {table}").collect()]
-            optimization_results.append({"table": table, "startedAtUtc": optimized_at,
+            optimization_results.append({"table": table, "phase": "before_step",
+                                         "postStepForRunId": PREVIOUS_STRESS_RUN_ID or None,
+                                         "startedAtUtc": optimized_at,
                                          "finishedAtUtc": datetime.now(timezone.utc).isoformat(),
                                          "metrics": metrics})
     warm_output_writes()
@@ -103,6 +156,7 @@ try:
                 baseline_progress_keys.add(progress_key)
                 baseline_progress.append(item)
         progress = baseline_progress_dict(active.lastProgress)
+        stress_sample(progress)
         caught_up = (progress is not None and all(
             progress["sources"][0]["endOffset"][KAFKA_TOPIC].get(partition, -1) >= end
             for partition, end in warm_ends.items()))
@@ -138,11 +192,42 @@ try:
 except Exception as error:
     baseline_error = {"errorType": type(error).__name__,
                       "errorCode": str(error) if isinstance(error, KqlQueryError) else None,
+                      "diagnosticCodes": sorted(set(re.findall(
+                          r"\b(?:[A-Za-z]*OutOfMemory[A-Za-z]*|ExecutorLostFailure|"
+                          r"FetchFailed|KQLHttp[0-9]{3}|Baseline[A-Za-z]+|"
+                          r"FixedExecutor[A-Za-z]+|[A-Za-z]*Throttl[A-Za-z]*)\b", str(error)))),
                       "traceback": [{"function": frame.name, "line": frame.lineno}
                                     for frame in traceback.extract_tb(error.__traceback__)]}
 finally:
     if active is not None:
         active.stop()
+
+if STRESS_TEST:
+    post_step_optimization["consumerStoppedAtUtc"] = datetime.now(timezone.utc).isoformat()
+    if baseline_error is not None:
+        post_step_optimization["status"] = "SkippedAfterProcessingFailure"
+    else:
+        try:
+            if active is not None and active.isActive:
+                raise RuntimeError("OptimizeBlockedActiveConsumer")
+            for table in (TABLE_EVENTS, TABLE_SCORES, TABLE_AUDIT, TABLE_QUARANTINE):
+                optimized_at = datetime.now(timezone.utc).isoformat()
+                metrics = [row.asDict(recursive=True)
+                           for row in spark.sql(f"OPTIMIZE {table}").collect()]
+                post_step_optimization["results"].append({
+                    "table": table, "phase": "after_step",
+                    "startedAtUtc": optimized_at,
+                    "finishedAtUtc": datetime.now(timezone.utc).isoformat(),
+                    "metrics": metrics, "allocation": _verify_session_allocation(),
+                })
+            post_step_optimization["status"] = "Completed"
+        except Exception as error:
+            post_step_optimization["status"] = "Failed"
+            post_step_optimization["error"] = {
+                "errorType": type(error).__name__,
+                "traceback": [{"function": frame.name, "line": frame.lineno}
+                              for frame in traceback.extract_tb(error.__traceback__)],
+            }
 
 baseline_outputs = {
     table: [row.asDict(recursive=True) for row in spark.table(table)
@@ -177,6 +262,7 @@ baseline_report = {
     "runId": RUN_ID, "baselineRun": not LOAD_TEST and not SUSTAINED_DIAGNOSTIC,
     "loadTest": LOAD_TEST, "sustainedDiagnostic": SUSTAINED_DIAGNOSTIC,
     "rate": TEST_RATE, "minutes": TEST_MINUTES, "optimizations": optimization_results,
+    "postStepOptimization": post_step_optimization,
     "acceptancePassed": False,
     "oapEnabled": False, "startedAtUtc": baseline_start.isoformat(),
     "finishedAtUtc": datetime.now(timezone.utc).isoformat(),
@@ -187,6 +273,10 @@ baseline_report = {
     "kafkaWarmup": consumer_warmup, "brokerMetadataBefore": warm_kafka_metadata,
     "kqlWarmup": kql_warmup,
     "sessionAllocation": session_allocation,
+    "stressTest": STRESS_TEST, "stressHealth": stress_health,
+    "stressHealthErrors": stress_health_errors,
+    "scalingEvents": stress_scaling_events,
+    "allocationBasis": "dynamic_1_to_5_medium_existing_pool",
 }
 
 
@@ -197,6 +287,32 @@ def baseline_encode(value):
 
 
 baseline_json = json.dumps(baseline_report, default=baseline_encode)
-notebookutils.fs.put(
-    f"Files/diagnostics/functional-processing-{RUN_ID}.json", baseline_json, True)
-notebookutils.notebook.exit(baseline_json)
+baseline_evidence_path = f"Files/diagnostics/functional-processing-{RUN_ID}.json"
+if STRESS_TEST:
+    reporting_phases = []
+
+    def persist_reporting_phase(phase):
+        reporting_phases.append({
+            "phase": phase, "atUtc": datetime.now(timezone.utc).isoformat(),
+        })
+        notebookutils.fs.put(
+            f"Files/diagnostics/reporting-phases-{RUN_ID}.json",
+            json.dumps({
+                "runId": RUN_ID, "evidencePath": baseline_evidence_path,
+                "evidenceBytes": len(baseline_json.encode("utf-8")),
+                "phases": reporting_phases,
+                "exitReturnMarkerExpected": False,
+            }), True)
+
+    persist_reporting_phase("before_final_evidence_write")
+    notebookutils.fs.put(baseline_evidence_path, baseline_json, True)
+    persist_reporting_phase("after_final_evidence_write")
+    baseline_exit = json.dumps({
+        "kind": "persisted_stress_evidence_v1", "runId": RUN_ID,
+        "evidencePath": baseline_evidence_path,
+    })
+    persist_reporting_phase("before_notebook_exit")
+    notebookutils.notebook.exit(baseline_exit)
+else:
+    notebookutils.fs.put(baseline_evidence_path, baseline_json, True)
+    notebookutils.notebook.exit(baseline_json)

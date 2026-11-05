@@ -33,10 +33,13 @@ try {
     $configuration=([string]::Join('', $notebook.cells[0].source)) -replace '^%%configure\s*',''
     $configuration=$configuration|ConvertFrom-Json
     if($configuration.numExecutors -ne 1 -or
-        $configuration.conf.'spark.dynamicAllocation.enabled' -ne 'false' -or
+        $configuration.conf.'spark.dynamicAllocation.enabled' -ne 'true' -or
+        $configuration.conf.'spark.dynamicAllocation.minExecutors' -ne '1' -or
+        $configuration.conf.'spark.dynamicAllocation.initialExecutors' -ne '1' -or
+        $configuration.conf.'spark.dynamicAllocation.maxExecutors' -ne '5' -or
         $configuration.driverCores -ne 8 -or $configuration.executorCores -ne 8 -or
         $configuration.driverMemory -ne '56g' -or $configuration.executorMemory -ne '56g'){
-        throw 'Fixed executor setting must not expand the observed 16-core/56g-per-process envelope.'
+        throw 'Dynamic allocation must retain Medium nodes and the existing 1-to-5 executor ceiling.'
     }
     $source = [string]::Join('', $notebook.cells[1].source)
     if ($source -match '<injected-[^>]+>') {

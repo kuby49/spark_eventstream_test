@@ -1,6 +1,8 @@
 # Fabric Eventstream and Spark test environment
 
-> **Revised 30-minute baseline completed; pre-write latency still fails:** Run `6c76b370-0bed-4707-b195-9e8d905fdfe4`, job `c6e7c1a2-5cb9-4055-b216-791f09b776c8`, completed with **900 generated/acknowledged/raw, 90 derived/Events/Scores/audits, zero quarantine**, generator exit0 and no notebook error. All90 Events and90 Scores have processing timestamps. Send-to-pre-write Events maximum **34.243844s**, with10rows over20s; Scores maximum **40.720362s**, with5rows over30s. This is a changed-basis latency failure, not acceptance. Separate raw observer exited1 with132 observations; raw freshness coverage is incomplete. Compact evidence `.deployment\spark-prewrite-baseline-compact-summary.json`; full structured evaluation remains pending. Complete remote evidence is retained as `C:\ProgramData\esehspark\diagnostics\functional-processing-6c76b370-0bed-4707-b195-9e8d905fdfe4.b64` (295624characters). Slow bulk export was stopped to yield exclusive VM/producer/query/OPTIMIZE ownership to the user-requested separate Streaming load limits session. That session's new overload/crash scope may continue past latency-only failure while healthy; this does not change this baseline's failed result or authorize false passing prerequisite evidence. No Python producer remained at ownership release; completed notebook stopped its consumer before evidence export. No shutdown or policy/SKU/topology change.
+> **630/min KQL reproduction diagnostics:** Stress-only profiling records monotonic token-acquisition, request-setup, URL-open/response, read/decode/parse and postresponse deadline-check spans, plus bounded allowlisted HTTP status and request-ID/timing headers. Tokens, arbitrary headers and request bodies are not logged. These are client-wall-time measurements, not server execution durations; unavailable server duration remains null. The four-second client budget still starts before token acquisition, with unchanged retries and quarantine on a response completed after the deadline. The prior 630 run's one late-response quarantine and historical 360 session failure remain preserved; a clean repeat would not prove a theoretical maximum.
+
+> **Future HTTP-error diagnostics (local-only, not deployed):** When profiling is enabled, error responses are read once up to 8,193 bytes to enforce an 8,192-byte body limit. Only allowlisted error codes, known policy categories and numeric capacity limits are retained; raw messages, principals, arbitrary headers and bodies are discarded. Oversized, malformed or unreadable bodies are explicitly marked unavailable. The capture span consumes client wall time and may reduce the remaining existing retry budget; it does not increase deadlines or add retries. Existing unprofiled requests do not read error bodies. Historical 930 HTTP429 bodies cannot be recovered by this code change.
 
 > **Current user-directed measurement: Spark pre-write, not readable-output latency.** Events and Scores now add nullable `spark_processed_at TIMESTAMP`; `message_timestamp` continues to carry the generator's first-send timestamp unchanged. Events samples its own timestamp per event after the KQL average/fallback is ready, before staging that Events row. Scores samples per event after its successful scoring API response, before staging that Scores row. Reported latency is `(spark_processed_at - message_timestamp)` in seconds. Neither timestamp includes its output's subsequent Delta write/commit; Events is not a batch-final proxy. Scores still includes the preceding Events/pre-API audit writes and any earlier sequential work; these waits are not subtracted. UTC Spark session and synchronized VM/Spark clocks are assumed, not independently proven here. Replays preserve the first persisted processing timestamp; historic rows are not backfilled. New reports/gates explicitly require `latencyMeasurementBasis=spark_pre_write`, retain every-row 20s/30s thresholds and no longer require an independent Events/Scores reader. Raw OneLake publication remains a separate independent check. Historical visibility failures below remain failures, and this changed basis cannot prove the original independently readable-output SLA. The four durable stages are unchanged; the proposed two-commit redesign remains unapproved. All128local regressions/artifact checks pass; fresh verification below passed, but full revised acceptance is not yet established.
 
@@ -176,5 +178,155 @@ Use `Invoke-EventHubsAmqpDiagnostic.ps1 -DiagnosticKind functional-processing -K
 The acceptance CLI uses the generator JSONL manifest (`--manifest`) with independently exported `raw.json`, `events.json`, `scores.json`, `quarantine.json`, and `audit.json` from an evidence directory. It reports physical rows separately from distinct IDs, checks generated→acknowledged→raw ID sets, requires every baseline high-temperature event to be scored, validates all per-row independent-read latencies, and writes a machine-readable reconciliation result.
 
 **Current user override: no compute shutdown.** Retain VM/F8 running and do not invoke the shutdown helpers below without a new user instruction. Bounded test-owned consumers/observers may finish normally while compute stays on.
+
+For throughput/overload testing rather than functional acceptance, use
+`scripts\Invoke-SteppedStressTests.ps1`. It runs at most six 15-minute steps by
+default (30, 60, 90, 120, 150, 180 messages/minute), with a four-hour overall
+admission budget. A new step is admitted only with 40 minutes remaining.
+`-MaximumSteps` permits at most eight steps; reaching this ceiling is not a
+measured system limit. A separately admitted bounded continuation can start at
+the next increment with `-StartRate 210` after reviewing the prior series;
+never run two wrappers concurrently. The explicit `-StressTest -LoadTest -Baseline -KeepRunning`
+single-step mode requires the original completed/count-reconciled baseline
+handoff in `.deployment\stress-baseline-handoff.json`, not a fabricated passing
+latency/functional acceptance file. Existing identity, private-route,
+workload-exclusivity and pre-send allocation-readiness gates remain.
+Stress reporting persists the full result in the existing run-specific OneLake
+file before returning a compact, identity-validated exit pointer. Non-stress
+exit payloads are unchanged. A separate small phase file records before/after
+the final evidence write and immediately before notebook exit; exit terminates
+execution, so no after-exit marker is expected. Marker/read failures are retained
+explicitly and never make a failed Fabric job successful. This reporting-only
+change is being evaluated in a bounded 360/min reproduction; it does not prove
+the earlier session failure was caused by result size or notebook exit.
+The later explicit user-directed configuration enables dynamic allocation at
+1 initial/minimum through 5 maximum executors in the existing Medium Starter
+Pool (6 nodes maximum), retaining 8 cores/56g per driver/executor. The configured
+ceiling is 48 total cores, consistent with the F8 burst ceiling, not a guarantee
+of available allocation. No SKU or pool/node-size change is made. Live executor
+counts and scaling transitions are sampled about every 15 seconds and reported
+at serial step-evidence boundaries, not as instantaneous notifications.
+Completed fixed-16-core runs remain separate historical results and are not
+counted as dynamic-allocation sustained steps. Earlier executor decommissioning
+coincided with a roughly 23-second stage gap; scaling is not assumed to improve
+tail latency or driver-bound work.
+Stress steps OPTIMIZE Events, Scores, ProcessingAudit and Quarantine once,
+excluding the read-only RawEvents shortcut to mirrored KQL data, after draining and stopping the
+consumer, including the final step; they do not also run pre-test OPTIMIZE.
+Non-stress load tests retain their existing pre-test compaction. Post-test
+maintenance timings/results are separate from measured send/processing time;
+maintenance failure blocks continuation without being called a load crash.
+Already-submitted steps retain their submitted configuration; the post-only
+policy applies to subsequent submissions.
+The stress
+mode does not update the production notebook definition or start/resume compute.
+
+Latency failures are recorded independently and do not stop otherwise healthy
+steps. The VM supervisor checks the owned producer every ten seconds and stops
+new sends on consumer termination, explicit throttling/rejection, delivery
+failure, stale health (150 seconds), no committed progress with backlog for
+150 seconds, or at least two minutes' worth of high-event backlog sustained
+for 120 seconds. Unavailable mandatory health stops the run, not the compute.
+Only the owned producer and notebook job are stopped; checkpoint/data remain.
+The generator keeps exactly 10% high events per complete scheduled minute and
+aborts if pacing slips rather than pretending the requested rate was offered.
+
+`.deployment\stepped-stress-summary.json` and `stress-<rate>-<runId>.json`
+separate generated/acknowledged/raw/consumed/output counts, offered rate,
+committed high-event throughput, drain time, Kafka envelope lag, output backlog,
+latency and execution/safety boundaries. Kafka offset units are envelopes, not
+logical messages. Full evidence (including Spark stage/executor metric samples
+when accessible) remains on the VM at the returned `fullEvidencePath`; compact
+exports avoid repeatedly downloading KQL window snapshots. Spark UI metric
+access failures are reported explicitly, never as zero usage. ARM platform
+metrics do not support the `Microsoft.Fabric/capacities` namespace in this
+environment; an F8 label or latency/backlog alone is not proof of capacity
+exhaustion. All latency remains Spark **pre-own-write**: Events after KQL,
+Scores after API (including preceding writes/queueing), excluding each output's
+own Delta write. The original readable-output 20/30-second SLA is not proven.
+
+The generator warms topic metadata with a bounded read before anchoring its
+send schedule; this sends no events. Its manifest records scheduling lag, and
+a missed-interval record preserves both UTC/monotonic lag before fail-closed
+termination. This local change is not yet live validated: the first 240/min
+attempt acknowledged one message then hit its 250ms pacing guard. That is a
+producer execution boundary, not a measured Fabric throughput limit. The
+exact first-send/ack cause remains unproven while the serialized evidence-read
+RunCommand remains unresolved in that attempt's retained history. Subsequent
+metadata-warmed retries completed 240, 270 and 300/min; this validates those
+offered rates, but does not retrospectively prove the original stall's cause.
+Stopping a local CLI wait does not cancel
+VM execution or release exclusive management-command ownership.
+
+Spark stage failure reasons are retained as explicitly labeled plain text
+(`Spark failure: ...`) so bracketed Spark error classes are not mistaken for
+embedded JSON by the fail-closed evidence sanitizer. The recovered 300/min
+report includes four failed tasks in stage 204 with
+`CHECKPOINT_RDD_BLOCK_ID_NOT_FOUND`; the job recovered and all counts reconcile.
+The error permits executor loss or RDD unpersisting as possible causes; neither
+is established merely by this message, and it is not capacity exhaustion proof.
+
+The later 330/min attempt acknowledged 3,399 messages before a missed schedule:
+279ms UTC lag against a 181.8ms interval, after the preceding acknowledgement
+took 96ms. That is a generator execution boundary, not a Fabric limit. The
+bounded retry keeps a single manifest handle open to avoid repeated directory
+checks/file-open costs, while retaining flush/fsync for every generated record
+before publish and every acknowledgement before the next send. It does not use
+a volatile writer queue or relax pacing. Schedule wake/lag, enqueue/delivery
+times and manifest write/flush/fsync timings are retained for diagnosis.
+
+Historical serial capability probes in `tests\test_producer_capability.py` confirm that
+600ms delivery or per-record fsync stalls cannot sustain a 166.7ms send interval
+under the current serial durability contract. Generated-write failures prevent
+publish; acknowledgement-write failures stop further sends; queue saturation
+has bounded attempts and never records a successful acknowledgement. Retries
+retain identical payload bytes, IDs and timestamps. Restarting with the same
+run ID currently appends new generated identities rather than replaying
+unresolved manifest entries: the manifest is recovery evidence, not an
+implemented crash-recovery outbox. Kafka client idempotence must not be
+interpreted as cross-process replay deduplication.
+
+**User-approved background delivery tracking:** The simulator now uses the
+existing client's asynchronous `produce`/`poll` API instead of flushing after
+every message. It sends on schedule without waiting for each acknowledgement.
+A delivery tracker fsyncs acknowledgement records in the background; inflight
+slots are retained until those writes finish. Both application inflight and
+client message queues are bounded at 64; the client queue also has a 1 MiB
+payload budget. Generated records remain fsynced before publish, and a lock
+serializes manifest writes. Thus slow storage can still stop the schedule:
+background acknowledgements do not guarantee an unlimited offered rate.
+
+Delivery callbacks permit at most two application attempts with identical
+payload bytes, IDs and original timestamps. Fatal delivery/storage errors or
+queue saturation explicitly stop admission. A bounded 20-second drain checks
+outstanding acknowledgements, then joins the tracker before closing the
+manifest. Unresolved identities remain in generated evidence and cause
+failure, never a successful delivery count. This is not a new durable outbox
+or automatic crash/restart replay implementation; cross-process exactly-once
+delivery is not claimed.
+
+This explicitly replaces acknowledgement-fsync-before-next-send ordering,
+while keeping generated-before-publish durability. Slow fsync separates the
+original timestamp sample from actual client enqueue. Acknowledgements retain
+the first enqueue timestamp separately; stress summaries distinguish
+generation rate from actual first-enqueue rate, which is complete only when
+all generated events have delivery acknowledgement evidence. No timestamps
+are shifted to hide delay. `tests\test_background_delivery.py` covers overlap,
+600ms simulated delivery, exact mix, failure propagation and bounded drain.
+The updated sender has not yet been validated in a paid live load test.
+
+**Later user-approved stress logging mode:** Stress runs now pass
+`--buffered-manifest`: a bounded 4,096-record writer queue flushes diagnostic
+logs for live monitoring about once a second and fsyncs at final close.
+Generated records are no longer guaranteed durable before publish, and a
+process/VM crash can lose unsaved generated or acknowledgement log records.
+Queue saturation, writer errors, delivery failures and bounded-drain failures
+remain explicit failures. Normal non-stress runs retain per-record fsync.
+Brief scheduling delays no longer abort buffered stress runs: the next send
+is spaced at least one requested interval after the preceding enqueue, with
+no catch-up burst. Exact high-temperature mix applies to each complete logical
+scheduled minute; delayed minutes can take longer than wall-clock minutes.
+Actual first-enqueue rate is reported separately and may be below target.
+These changes do not resolve or explain the earlier Fabric session failure.
 
 For a future user-authorized shutdown, stop the generator, drain Spark, export evidence, and wait for Eventhouse OneLake publication. `Stop-FabricNotebook.ps1` cancels and monitors the exact persisted notebook job. The normal `Stop-TestEnvironment.ps1 -ShutdownEvidencePath <json>` path requires complete passing acceptance evidence. The separately approved idle path, `-IdleShutdownEvidencePath <json>`, is only for a no-workload shutdown before acceptance; it requires fresh proof that the generator and notebook are stopped, no active generator tasks or notebook jobs exist, processing is drained, there are no unresolved records, and inventory, full policies, canary diagnostics, and evidence are exported. `Export-IdleShutdownEvidence.ps1` captures those read-only checks and fails if a workload is active; a zero-input deployment does not require fabricated acceptance or raw-publication evidence. It does not mark acceptance as passed. Both paths discover and suspend only `fabricessparktest8` F8 and deallocate only `vmesehspark`, verify the final states, and write `.deployment\shutdown-result.json`; all resources and data are retained. Bastion, NAT, private endpoints, the B1 plan, disks, IPs, storage and Key Vault continue to incur idle charges. Current partial active-hour rates total `$1.89 + $0.01 × endpoint-count` before usage-based charges; the observed seven private endpoints imply `$1.96/hour` before disks, storage, Key Vault, transfer, NAT/private-link processing and other usage. With F8 suspended and VM deallocated, the retained B1/Bastion/NAT/two IPs/seven PE subtotal is approximately `$0.332/hour` (`$242.36` per 730-hour month), excluding disks, storage, Key Vault, DNS and usage charges; this is not a complete bill. Rates are the previously recorded retail evidence, not a fresh quote.

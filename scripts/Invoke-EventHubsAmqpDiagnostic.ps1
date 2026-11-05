@@ -5,6 +5,7 @@ param(
     [switch] $ReuseLastHighFixture,
     [switch] $Baseline,
     [switch] $LoadTest,
+    [switch] $StressTest,
     [switch] $FaultMatrix,
     [switch] $WriteProfile,
     [switch] $OptimizeWriteProfile,
@@ -51,6 +52,9 @@ if($Baseline){
     $LiveHighFixture=$true
 }
 if($LoadTest -and -not $Baseline){throw 'LoadTest requires Baseline execution mode.'}
+if($StressTest -and (-not $LoadTest -or -not $KeepRunning)){
+    throw 'StressTest requires LoadTest, Baseline and KeepRunning.'
+}
 if(-not $LoadTest -and $TestRate -ne 30){throw 'Initial baseline rate must remain 30/min.'}
 $testMinutes=if($SustainedDiagnostic){5}elseif($LoadTest){15}else{30}
 $env:AZURE_CONFIG_DIR = Join-Path $HOME '.azure-mcap'
@@ -61,11 +65,24 @@ $subscription = '0a0cf761-9d5d-4862-9165-7b69c188a0ee'
 $root = Split-Path -Parent $PSScriptRoot
 $directory = Join-Path $root '.deployment'
 if($Baseline){
-    if($LoadTest){
+    if($LoadTest -and -not $StressTest){
         $accepted=Get-Content (Join-Path $directory 'baseline-acceptance.json') -Raw|ConvertFrom-Json
         if(-not $accepted.pass -or $accepted.rate -ne 30 -or $accepted.minutes -ne 30 -or
             $accepted.latencyMeasurementBasis -ne 'spark_pre_write'){
             throw 'Initial 30-minute baseline must pass before load tests.'
+        }
+    }
+    if($StressTest){
+            $handoffResponse=Get-Content (Join-Path $directory 'stress-baseline-handoff.json') -Raw|ConvertFrom-Json
+            $handoffText=@($handoffResponse.value|Where-Object code -eq 'ComponentStatus/StdOut/succeeded')[0].message
+            if($handoffText -notmatch 'BASELINE_COMPACT:(\{[^\r\n]+\})'){throw 'Baseline handoff identity missing.'}
+            $handoff=$Matches[1]|ConvertFrom-Json
+            if($handoff.jobStatus -ne 'Completed' -or $handoff.error -or $handoff.failedStage -or
+                $handoff.generatorExitCode -ne 0 -or $handoff.counts.generated -ne 900 -or
+                $handoff.counts.acknowledged -ne 900 -or $handoff.counts.rawRecords -ne 900 -or
+                $handoff.counts.'lhspark.Events' -ne 90 -or $handoff.counts.'lhspark.Scores' -ne 90 -or
+                $handoff.counts.'lhspark.Quarantine' -ne 0){
+                throw 'Stress requires completed, count-reconciled baseline; latency acceptance is separate.'
         }
     }
     $clean=Get-Content (Join-Path $directory 'functional-processing-fresh-clean-latency.json') -Raw|ConvertFrom-Json
@@ -105,6 +122,16 @@ $fixtureProducer=''
 $fixturePrivateHelper=''
 $lifecycleHelper=''
 $observerSource=''
+$previousStressRunId=''
+if($StressTest -and (Test-Path (Join-Path $directory 'functional-processing-results.json'))){
+    $prior=Get-Content (Join-Path $directory 'functional-processing-results.json') -Raw|ConvertFrom-Json
+    if($prior.postStepOptimization.status -eq 'Failed'){
+        throw 'Prior post-test OPTIMIZE failed; investigate retained maintenance evidence before sending more traffic.'
+    }
+    if($prior.sustained -and $prior.postStepOptimization.status -ne 'Completed'){
+        $previousStressRunId=[guid]::Parse($prior.runId).ToString()
+    }
+}
 $workloadInventorySource=[Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $PSScriptRoot 'Read-PrivateWorkloadInventory.ps1')))
 if($DiagnosticKind -eq 'functional-processing'){
     $gate=Get-Content (Join-Path $directory 'oap-off-ingestion-gate-results.json') -Raw | ConvertFrom-Json
@@ -167,6 +194,8 @@ if($DiagnosticKind -eq 'functional-processing'){
         '<injected-live-fixture>'=$LiveHighFixture.IsPresent.ToString().ToLowerInvariant();
         '<injected-fixture-average>'=$average.ToString([Globalization.CultureInfo]::InvariantCulture)
         '<injected-load-test>'=$LoadTest.IsPresent.ToString().ToLowerInvariant();
+        '<injected-stress-test>'=$StressTest.IsPresent.ToString().ToLowerInvariant();
+        '<injected-previous-stress-run-id>'=$previousStressRunId;
         '<injected-sustained-diagnostic>'=$SustainedDiagnostic.IsPresent.ToString().ToLowerInvariant();
         '<injected-test-rate>'=$TestRate;'<injected-test-minutes>'=$testMinutes
         '<injected-replay-run-id>'=$ReplayQuarantineRunId
@@ -197,7 +226,7 @@ $runtime = [Convert]::ToBase64String([IO.File]::ReadAllBytes(
 $measureRawPublication=$Baseline -and -not $LoadTest -and -not $SustainedDiagnostic
 $remote = @"
 `$source=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$runtime'))
-& ([scriptblock]::Create(`$source)) -WorkspaceId '$($inventory.workspaceId)' -LakehouseId '$($inventory.lakehouseId)' -ExpectedCapacityId '$($inventory.capacityId)' -NotebookPayload '$payload' -RunId '$runId' -DiagnosticKind '$DiagnosticKind' -ProductionNotebookPayload '$productionPayload' -FixtureMessageId '$fixtureMessageId' -FixtureProducer '$fixtureProducer' -FixturePrivateHelper '$fixturePrivateHelper' -LifecycleHelper '$lifecycleHelper' -ObserverSource '$observerSource' -WorkloadInventorySource '$workloadInventorySource' -Baseline `$$($Baseline.IsPresent.ToString().ToLowerInvariant()) -SustainedDiagnostic `$$($SustainedDiagnostic.IsPresent.ToString().ToLowerInvariant()) -MeasureRawPublication `$$($measureRawPublication.ToString().ToLowerInvariant()) -FaultMatrix `$$($FaultMatrix.IsPresent.ToString().ToLowerInvariant()) -TestRate $TestRate -TestMinutes $testMinutes
+& ([scriptblock]::Create(`$source)) -WorkspaceId '$($inventory.workspaceId)' -LakehouseId '$($inventory.lakehouseId)' -ExpectedCapacityId '$($inventory.capacityId)' -NotebookPayload '$payload' -RunId '$runId' -DiagnosticKind '$DiagnosticKind' -ProductionNotebookPayload '$productionPayload' -FixtureMessageId '$fixtureMessageId' -FixtureProducer '$fixtureProducer' -FixturePrivateHelper '$fixturePrivateHelper' -LifecycleHelper '$lifecycleHelper' -ObserverSource '$observerSource' -WorkloadInventorySource '$workloadInventorySource' -Baseline `$$($Baseline.IsPresent.ToString().ToLowerInvariant()) -StressTest `$$($StressTest.IsPresent.ToString().ToLowerInvariant()) -SustainedDiagnostic `$$($SustainedDiagnostic.IsPresent.ToString().ToLowerInvariant()) -MeasureRawPublication `$$($measureRawPublication.ToString().ToLowerInvariant()) -FaultMatrix `$$($FaultMatrix.IsPresent.ToString().ToLowerInvariant()) -TestRate $TestRate -TestMinutes $testMinutes
 "@
 $runtimePath = Join-Path $directory "$DiagnosticKind-runtime.ps1"
 [IO.File]::WriteAllText($runtimePath, $remote, [Text.UTF8Encoding]::new($false))
@@ -210,6 +239,7 @@ Save-FabricEvidence (Join-Path $directory "$DiagnosticKind-run.json") @{
 try {
     $capacity = Az-Json @('rest','--method','get','--url',$capacityUri)
     if ($capacity.sku.name -ne 'F8') { throw 'Exact approved F8 not verified.' }
+    if($StressTest -and $capacity.properties.state -ne 'Active'){throw 'Stress requires already-active F8; no resume authorized.'}
     if ($capacity.properties.state -eq 'Paused') {
         $null = Az-Json @('rest','--method','post','--url',
             "https://management.azure.com$capacityId/resume?api-version=2023-11-01")
@@ -220,7 +250,12 @@ try {
         $capacity = Az-Json @('rest','--method','get','--url',$capacityUri)
         if ([DateTime]::UtcNow -gt $deadline) { throw 'F8 readiness timed out.' }
     } while ($capacity.properties.state -ne 'Active')
-    $null = Az-Json @('vm','start','-g','rg_esehspark','-n','vmesehspark')
+    if($StressTest){
+        $power=Az-Json @('vm','get-instance-view','-g','rg_esehspark','-n','vmesehspark')
+        if('PowerState/running' -notin @($power.instanceView.statuses.code)){throw 'Stress requires already-running VM.'}
+    }else{
+        $null = Az-Json @('vm','start','-g','rg_esehspark','-n','vmesehspark')
+    }
     $command = Az-Json @('vm','run-command','invoke','-g','rg_esehspark','-n','vmesehspark',
         '--command-id','RunPowerShellScript','--scripts',"@$runtimePath")
     $stdout = @($command.value | Where-Object code -eq 'ComponentStatus/StdOut/succeeded')
@@ -255,6 +290,9 @@ try {
     }
     Save-FabricEvidence (Join-Path $directory "$DiagnosticKind-results.json") $result
     Write-Output ($result | ConvertTo-Json -Depth 30)
+    if($StressTest -and $result.postStepOptimization.status -eq 'Failed'){
+        throw 'Post-test OPTIMIZE failed; traffic results retained separately. No next step authorized by this runner.'
+    }
 }
 finally {
     if($KeepRunning){

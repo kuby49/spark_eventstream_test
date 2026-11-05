@@ -21,6 +21,8 @@ def profile_helper(name, operation):
             timing["runId"] = args[0]["run_id"]
             timing["messageId"] = args[0]["message_id"]
         try:
+            if name == "kql_request" and globals().get("STRESS_TEST", False):
+                kwargs["diagnostics"] = timing.setdefault("requestDiagnostics", {})
             result = operation(*args, **kwargs)
             if name == "score_api":
                 timing["attempts"] = result[1]

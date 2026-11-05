@@ -128,7 +128,10 @@ def _utcnow():
 def _verify_session_allocation(require_executor=False):
     conf = spark.sparkContext.getConf()
     expected = {
-        "spark.dynamicAllocation.enabled": "false",
+        "spark.dynamicAllocation.enabled": "true",
+        "spark.dynamicAllocation.minExecutors": "1",
+        "spark.dynamicAllocation.initialExecutors": "1",
+        "spark.dynamicAllocation.maxExecutors": "5",
         "spark.driver.cores": "8",
         "spark.driver.memory": "56g",
         "spark.executor.cores": "8",
@@ -137,13 +140,17 @@ def _verify_session_allocation(require_executor=False):
     }
     observed = {key: conf.get(key, "unset") for key in expected}
     if observed != expected:
-        raise RuntimeError("FixedExecutorConfigurationNotApplied")
+        raise RuntimeError("DynamicExecutorConfigurationNotApplied")
     executors = spark.sparkContext._jsc.sc().getExecutorMemoryStatus().size() - 1
-    if executors not in (0, 1) or (require_executor and executors != 1):
-        raise RuntimeError("FixedExecutorCountMismatch")
+    if not 0 <= executors <= 5 or (require_executor and executors < 1):
+        raise RuntimeError("DynamicExecutorCountOutsideApprovedPool")
     return {"checkedAtUtc": datetime.now(timezone.utc).isoformat(),
             "configuration": observed, "activeExecutors": executors,
-            "maximumDriverAndExecutorCores": 16}
+            "minimumExecutors": 1, "maximumExecutors": 5,
+            "observedDriverAndExecutorCores": 8 + executors * 8,
+            "maximumDriverAndExecutorCores": 48,
+            "allocationBasis": "dynamic_1_to_5_medium_existing_pool",
+            "maximumAvailabilityGuaranteed": False}
 
 
 def _upsert(table_name, rows):
@@ -185,7 +192,80 @@ def _kusto_token():
     return notebookutils.credentials.getToken("kusto")
 
 
-def _query_kusto(query, parameters, timeout_seconds=4.0):
+def _query_kusto(query, parameters, timeout_seconds=4.0, diagnostics=None):
+    def measure(phase, operation):
+        if diagnostics is None:
+            return operation()
+        started = time.monotonic()
+        entry = {"phase": phase, "startedMonotonic": started, "completed": False}
+        diagnostics.setdefault("phases", []).append(entry)
+        try:
+            value = operation()
+            entry["completed"] = True
+            return value
+        finally:
+            entry["elapsedSeconds"] = time.monotonic() - started
+
+    def capture_response(response, attempt_info):
+        if diagnostics is None:
+            return
+        attempt_info["httpStatus"] = getattr(response, "status", getattr(response, "code", None))
+        headers = getattr(response, "headers", {})
+        attempt_info["headers"] = {}
+        for name in ("x-ms-request-id", "x-ms-activity-id", "x-ms-root-activity-id",
+                     "x-ms-service-request-id", "x-ms-client-request-id",
+                     "x-ms-kusto-query-execution-time", "Retry-After"):
+            value = headers.get(name)
+            if value is not None:
+                # Keep only bounded identifiers/numeric timing, never arbitrary headers.
+                attempt_info["headers"][name] = "".join(
+                    char for char in str(value)[:256]
+                    if char.isascii() and (char.isalnum() or char in "-_.;: "))
+
+    def capture_error_body(error, attempt_info):
+        if diagnostics is None:
+            return
+        import re
+        captured = {"maximumBytes": 8192, "rawBodyRetained": False}
+        attempt_info["errorBody"] = captured
+        try:
+            read = getattr(error, "read1", error.read)
+            raw = read(8193)
+            captured["bytesRead"] = len(raw)
+            if len(raw) > 8192:
+                captured["status"] = "Oversized"
+                return
+            parsed = json.loads(raw.decode("utf-8"))
+            if not isinstance(parsed, dict):
+                captured["status"] = "UnsupportedShape"
+                return
+            detail = parsed.get("error", parsed)
+            if not isinstance(detail, dict):
+                captured["status"] = "UnsupportedShape"
+                return
+            captured["status"] = "ParsedSanitized"
+            allowed_codes = {
+                "TooManyRequests", "QueryThrottledException", "ControlCommandThrottledException",
+                "CapacityExceeded", "Throttled", "Forbidden", "BadRequest",
+            }
+            for field in ("code", "@type"):
+                value = detail.get(field)
+                if isinstance(value, str) and value.rsplit(".", 1)[-1] in allowed_codes:
+                    captured[field] = value.rsplit(".", 1)[-1]
+            text = " ".join(value for key in ("message", "@message")
+                            if isinstance((value := detail.get(key)), str))
+            # Extract only known policy categories and numeric limits, not messages/principals.
+            for category in ("RequestRateLimitPolicy", "ConcurrentRequests", "ResourceUtilization",
+                             "CapacityPolicy"):
+                if category in text:
+                    captured.setdefault("policyCategories", []).append(category)
+            capacity = re.search(r"\bCapacity:\s*(\d{1,9})\b", text)
+            if capacity:
+                captured["capacityLimit"] = int(capacity.group(1))
+        except (OSError, ValueError, UnicodeError) as failure:
+            captured["status"] = "CaptureUnavailable"
+            captured["errorType"] = type(failure).__name__
+
     encoded_parameters = {}
     for name, value in parameters.items():
         if isinstance(value, bool):
@@ -201,7 +281,11 @@ def _query_kusto(query, parameters, timeout_seconds=4.0):
         separators=(",", ":"),
     ).encode("utf-8")
     deadline = time.monotonic() + timeout_seconds
-    token = _kusto_token()
+    if diagnostics is not None:
+        diagnostics["clientBudgetSeconds"] = timeout_seconds
+        diagnostics["deadlineMonotonic"] = deadline
+        diagnostics["serverDurationSeconds"] = None
+    token = measure("token_acquisition", _kusto_token)
     last_error = None
     attempts = 0
     for attempt in (1, 2):
@@ -209,24 +293,37 @@ def _query_kusto(query, parameters, timeout_seconds=4.0):
         if remaining <= 0:
             break
         attempts = attempt
-        request = urllib.request.Request(
+        client_request_id = f"esehspark;{uuid.uuid4()}"
+        attempt_info = {"attempt": attempt, "clientRequestId": client_request_id}
+        if diagnostics is not None:
+            diagnostics.setdefault("requests", []).append(attempt_info)
+        request = measure("request_setup", lambda: urllib.request.Request(
             f"{KUSTO_ENDPOINT.rstrip('/')}/v1/rest/query",
             data=body,
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
                 "Accept": "application/json",
-                "x-ms-client-request-id": f"esehspark;{uuid.uuid4()}",
+                "x-ms-client-request-id": client_request_id,
             },
             method="POST",
-        )
+        ))
         try:
-            with urllib.request.urlopen(request, timeout=min(2.0, remaining)) as response:
-                result = json.loads(response.read().decode("utf-8"))
-                if time.monotonic() > deadline:
+            with measure("urlopen_response", lambda: urllib.request.urlopen(
+                    request, timeout=min(2.0, remaining))) as response:
+                capture_response(response, attempt_info)
+                raw = measure("response_read", response.read)
+                decoded = measure("response_decode", lambda: raw.decode("utf-8"))
+                result = measure("response_parse", lambda: json.loads(decoded))
+                late = measure("postresponse_deadline_check", lambda: time.monotonic() > deadline)
+                if diagnostics is not None:
+                    diagnostics["responseCompletedAfterDeadline"] = late
+                if late:
                     raise KqlQueryError("KQLDeadlineExceeded", attempts, "ResponseCompletedAfterDeadline")
                 return result
         except urllib.error.HTTPError as error:
+            capture_response(error, attempt_info)
+            measure("http_error_body_capture", lambda: capture_error_body(error, attempt_info))
             last_error = f"KQLHttp{error.code}"
             if error.code not in {408, 429, 500, 502, 503, 504} or attempt == 2:
                 raise KqlQueryError(last_error, attempts, last_error) from None
